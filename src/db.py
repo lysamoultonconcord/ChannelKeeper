@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional
 import streamlit as st
 import snowflake.connector
 from snowflake.connector.cursor import DictCursor
@@ -13,11 +13,12 @@ from .constants import TABLE_FQN
 class SnowflakeCfg:
     account: str
     user: str
-    password: str
-    role: str | None = None
-    warehouse: str | None = None
-    database: str | None = None
-    schema: str | None = None
+    password: Optional[str] = None
+    authenticator: Optional[str] = None
+    role: Optional[str] = None
+    warehouse: Optional[str] = None
+    database: Optional[str] = None
+    schema: Optional[str] = None
 
 
 def get_snowflake_cfg() -> SnowflakeCfg:
@@ -25,7 +26,8 @@ def get_snowflake_cfg() -> SnowflakeCfg:
     return SnowflakeCfg(
         account=s["account"],
         user=s["user"],
-        password=s["password"],
+        password=s.get("password"),              # optional
+        authenticator=s.get("authenticator"),    # optional (e.g. externalbrowser)
         role=s.get("role"),
         warehouse=s.get("warehouse"),
         database=s.get("database"),
@@ -33,17 +35,36 @@ def get_snowflake_cfg() -> SnowflakeCfg:
     )
 
 
+@st.cache_resource
 def get_connection():
+    """
+    Cached Snowflake connection so Streamlit reruns don't keep re-authing.
+    Supports either:
+      - SSO via authenticator=externalbrowser (no password)
+      - Password auth via password=...
+    """
     cfg = get_snowflake_cfg()
-    return snowflake.connector.connect(
-        account=cfg.account,
-        user=cfg.user,
-        password=cfg.password,
-        role=cfg.role,
-        warehouse=cfg.warehouse,
-        database=cfg.database,
-        schema=cfg.schema,
-    )
+
+    conn_kwargs = {
+        "account": cfg.account,
+        "user": cfg.user,
+        "role": cfg.role,
+        "warehouse": cfg.warehouse,
+        "database": cfg.database,
+        "schema": cfg.schema,
+    }
+
+    if cfg.authenticator:
+        conn_kwargs["authenticator"] = cfg.authenticator
+    else:
+        # If no authenticator, we require password
+        if not cfg.password:
+            raise KeyError(
+                'Missing Snowflake auth. Add either snowflake.password or snowflake.authenticator to secrets.toml'
+            )
+        conn_kwargs["password"] = cfg.password
+
+    return snowflake.connector.connect(**conn_kwargs)
 
 
 def fetch_channel(channel_id: str) -> Optional[Dict[str, Any]]:
@@ -53,23 +74,13 @@ def fetch_channel(channel_id: str) -> Optional[Dict[str, Any]]:
         WHERE CHANNEL_ID = %s
         LIMIT 1
     """
-    with get_connection() as con:
-        with con.cursor(DictCursor) as cur:
-            cur.execute(sql, (channel_id,))
-            return cur.fetchone()
+    con = get_connection()
+    with con.cursor(DictCursor) as cur:
+        cur.execute(sql, (channel_id,))
+        return cur.fetchone()
 
 
 def merge_upsert(payload: Dict[str, Any]) -> None:
-    """
-    MERGE into BUS_CORPORATE.RIGHTS_OPTIMIZATION.CHANNEL_MASTER keyed by CHANNEL_ID.
-
-    payload keys should include:
-      CHANNEL_ID, CHANNEL_TITLE, DATE_CREATED, URL, ARTIST_NAME, STATUS, LABEL_PUB, LMS,
-      LOGIN_AFFILIATION, NETWORK, ACCESS_LEVEL, GAIN_CREATE, DATE_GAINED, OAC, VERIFIED,
-      VEVO_ID, OAC_REQUESTED, OAC_DATE_REQUESTED, OAC_MERGE_CONFIRMATION_DATE, NOTES,
-      YPP_STATUS, ACCESS_LOST, DATE_OF_LOSS, UPDATED_BY
-    """
-
     cols = [
         "CHANNEL_ID",
         "CHANNEL_TITLE",
@@ -166,7 +177,7 @@ def merge_upsert(payload: Dict[str, Any]) -> None:
     );
     """
 
-    with get_connection() as con:
-        with con.cursor() as cur:
-            cur.execute(merge_sql, vals)
-        con.commit()
+    con = get_connection()
+    with con.cursor() as cur:
+        cur.execute(merge_sql, vals)
+    con.commit()
